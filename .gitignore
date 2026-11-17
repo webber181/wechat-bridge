@@ -1,0 +1,15 @@
+# 运行数据：游标、收件箱、发件箱、媒体文件、登录态 —— 不进仓库
+state.json
+inbox.jsonl
+outbox.jsonl
+replied.txt
+last_notifystart
+last_poll.json
+login.json
+login-qr.png
+login-out.log
+verify_code.txt
+media/
+*.bak
+*.bak-*
+*.tmp-*
