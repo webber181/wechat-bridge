@@ -47,6 +47,12 @@ else
       log "skip wake: an agent is already executing a message"
       silent "already executing" '{}'
     else
+      # 点亮“正在输入”（学 gfydfhcf/wechat-ilink-muse-bridge：批次落地即亮，
+      # 不等 worker 启动）：让用户立刻看到机器人在干活；失败忽略，绝不阻塞唤醒。
+      sender="$(BRIDGE="$BRIDGE" node -e 'const fs=require("fs");let s="";try{for(const l of fs.readFileSync(process.env.BRIDGE+"/inbox.jsonl","utf-8").split("\n")){if(!l.trim())continue;const e=JSON.parse(l);if(e.status==="received"&&!e.group_id&&e.from)s=e.from;}}catch{}process.stdout.write(s);' 2>/dev/null)"
+      if [ -n "$sender" ]; then
+        timeout 10 node "$BRIDGE/wxbridge.mjs" typing --to "$sender" start >/dev/null 2>&1 || true
+      fi
       wake "wechat-new-messages" "{\"count\":$new_messages}"
     fi
   else
