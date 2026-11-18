@@ -5,7 +5,7 @@
 再由 Agent（本仓库以 Muse 为例）认领收件箱里的消息、回微信。
 
 这份仓库是可直接跑的部署方法论：脚本 + 轮询 hook + 运维笔记。
-私有仓库，先私有、确认无敏感信息后再考虑公开。
+仓库已公开；公开前已做脱敏自查（bot 账号 id 走环境变量、凭据永不进仓库）。
 
 ## 它能做什么
 
@@ -15,6 +15,9 @@
   直接读图批改、认字、答题——不是只回一句“收到一张图片”。
 - 稳：游标后推进（崩溃重放不丢消息）、-14 先观察 5 分钟再判过期、
   健康心跳 `health.json`、防重复唤醒（执行中 10 分钟内不再唤醒）。
+- 快：唤醒即亮“正在输入”（`typing start/stop`）、发送前复查合并
+  （同一发送者的新消息并进来只回一条）；发送守卫拦空正文与
+  `--` 开头正文；陌生发信人只登记不放行；引用消息可还原被引原文。
 
 ## 架构
 
@@ -39,11 +42,11 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `wxbridge.mjs` | 桥本体：poll / send / sendmedia / mark / status / login |
+| `wxbridge.mjs` | 桥本体：poll / send / sendmedia / mark / status / login / typing |
 | `wxmedia.mjs` | 媒体收发：CDN 下载、AES 解密、上传（getuploadurl → CDN → sendmessage） |
 | `hooks/weixin-inbox.sh` | 轮询脚本：20 秒一次 `poll --quick`，只在有未回复消息或 session 过期时唤醒 Agent |
 | `hooks/weixin-inbox.json` | hook 定义：提示词、轮询间隔、唤醒条件 |
-| `NOTES.md` | 运维笔记：命令、四态流转、过滤规则、凭据说明、2026-11-17 提升方案 |
+| `NOTES.md` | 运维笔记：命令、四态流转、过滤规则、凭据说明、2026-11-17 / 2026-11-18 提升方案 |
 | `.gitignore` | 运行数据黑名单：inbox / outbox / state / media / 登录态一律不进仓库 |
 
 ## 快速开始
@@ -91,6 +94,10 @@ Node.js ≥ 18 即可，无第三方依赖（只有 `node:crypto / fs / path / o
 “2026-11-17 提升方案”一节：游标后推进、-14 先观察、长轮询超时跟随
 服务端、健康心跳、媒体双源回退、防重复唤醒。
 
+2026-11-18 又对照第三个同构仓库（`gfydfhcf/wechat-ilink-muse-bridge`，
+Python，iLink + Muse hook）学了 5 项，见 `NOTES.md`“2026-11-18 提升方案”：
+正在输入提示、发送守卫、陌生发信人登记、引用还原、发送前复查合并。
+
 ## 安全红线（API Key 保护）
 
 - Token 只在 `~/.openclaw/openclaw-weixin/accounts/` 的账号文件里，
@@ -99,7 +106,8 @@ Node.js ≥ 18 即可，无第三方依赖（只有 `node:crypto / fs / path / o
   `replied.txt`、`login.json`、`login-qr.png`、`media/`、一切 `*.bak`。
 - 发仓库前自查：`grep -r "你的账号id\|你的用户id" .` 应无命中；
   不要把 `inbox.jsonl` / `media/` 打包进任何备份里对外发。
-- 仓库默认私有；公开前重新扫一遍提交历史，不只是扫当前文件。
+- 仓库已公开；公开前重新扫过提交历史，不只是扫当前文件；
+  每次更新前同样先脱敏再推（bot 账号 id、side-chat id 一律占位）。
 
 ## 微信排版约定（实测）
 
