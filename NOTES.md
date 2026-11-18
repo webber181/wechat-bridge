@@ -21,14 +21,25 @@
 6. 防重复唤醒：hook 脚本在有消息且 10 分钟内已有 executing 时不再唤醒（学 wx-bot lease）；检查失败时 fail-open 照常唤醒。hook 提示词加“先回执再干活、简单问答一句话”。
 刻意没动的：不改轮询间隔（20s 不是瓶颈）、不迁 SQLite、不改常驻 serve 部署形态、不动图片密钥优先级（图片识别是现有优势）、不建 GitHub 公开/私有仓库（方法论分享另等用户点头）。
 
+## 2026-11-18 提升方案（已执行，用户指令“只要是优点都学、授权直接执行”）
+备份：`~/workspace/backups/weixin-bridge-20261118-1615/`（桥全量 + hook 定义/脚本 + RESTORE.md + sha256，token 未进备份）。
+对照研究的第三个仓库：gfydfhcf/wechat-ilink-muse-bridge（Python，284★，2026-11-17 更新，同构：iLink + Muse hook，README + ilink.py + hook 脚本全读过），落地 5 项，全部可回滚：
+1. 正在输入提示：`typing --to <uid> start|stop`（getconfig 取 typing_ticket 缓存 9 分钟 + sendtyping 开关，体裁照抄对方生产验证版）；hook 唤醒时即亮、worker 开工续亮、回完熄灭；失败永不阻塞。2026-11-18 实测 ok:true。
+2. 发送守卫：send 拒绝空正文与 `--` 开头正文（对方 2026-10-27 `--key` 误发事故的教训），只记审计、不发；caption 同理（丢弃 caption、媒体照发）。实测拦截 `--key` 成功。
+3. 陌生发信人登记：poll 丢弃非绑定用户消息时记 `unknown_senders.json`（id→次数/最后出现），放行只能主聊天人工定。
+4. 引用还原：poll 解析 ref_msg，用本地 inbox 历史还原被引原文（`quoted_text`/`quoted_from`），查不到只留 `quoted_fragment`；出站引用通道侧不支持，不实现。
+5. 发送前复查合并：发最终回复前再读一遍 inbox.jsonl，同一发送者更新的未回复消息并进来一起回（对方“发送前复查”的做法，流程级落地、无代码改动）。
+刻意没动的：媒体断点续传（media 目录仅 416K，文件小、双源回退已够用）、warm-wait 常驻守候（本机 hook 每次唤醒是全新 worker，无常驻 worker 可守）、发送幂等账本（本桥重试复用同一 client_id，服务端去重已覆盖；outbox 已有全量审计）、告警状态机/看门狗 cron（poll_failing 满 10 分钟才报、恢复报平安——需新增 cron 唤醒路径，本次未动）、版本订阅/自动更新（对方自有 release 体系，本桥私有仓库 webber181/wechat-bridge 另行管理）。
+
 ## 四态流转
 `received`(poll) → `executing`(agent 开工时 mark) → 发回复(`send`/`sendmedia` 记 outbox) → `replied`(agent 收尾时 mark)。
 `status` 命令看未回复数；`replied.txt` 是旧账本，`status` 会兼容它。
 
 ## Agent 处理微信消息的标准动作（被 hook 唤醒后）
-1. 读 `inbox.jsonl` 找 `status=received` 的新消息；`mark --status executing`。
-2. 有 `media[].path` → 用 read 看图/看视频；`media_unavailable=true` → 回「这条图片/视频没能下载成功，请用文字描述一下内容」。
-3. 文字任务正常执行；`send`/`sendmedia` 回结果；`mark --status replied`。
+1. 读 `inbox.jsonl` 找 `status=received` 的新消息；`mark --status executing`；开工即 `typing --to <from> start` 点亮“正在输入”（hook 唤醒时已亮过一次，这里是续亮）。
+2. 有 `media[].path` → 用 read 看图/看视频；`media_unavailable=true` → 回「这条图片/视频没能下载成功，请用文字描述一下内容」。有 `quoted_text` → 先看被引原文再回。
+3. 文字任务正常执行；发之前再读一遍 inbox.jsonl（发送前复查）：同一发送者如有更新的未回复消息，并进来一起回，只回一条。
+4. `send`/`sendmedia` 回结果；回完 `typing --to <from> stop`；`mark --status replied`。
 
 ## 过滤规则
 只处理 `from_user_id` = 账号文件 `userId`（扫码绑定用户）且 `group_id` 为空的消息。
