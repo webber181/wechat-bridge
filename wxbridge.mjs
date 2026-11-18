@@ -33,6 +33,11 @@
  *     received (poll) -> executing (agent starts) -> replied (agent answered).
  *     "pending-send/sent" live in outbox.jsonl per send chunk.
  *
+ *   node wxbridge.mjs typing --to <user_id> <start|stop>
+ *     点亮/取消微信里的“正在输入”提示（学 gfydfhcf/wechat-ilink-muse-bridge：
+ *     getconfig 取 typing_ticket 缓存 9 分钟 + sendtyping 开关）。装饰性功能，
+ *     失败只打印 ok:false，永不抛错、永不阻塞调用方。票据缓存只含 ticket，不含 token。
+ *
  *   node wxbridge.mjs status
  *     Read-only health snapshot from local files (no network, no secrets).
  *
@@ -68,6 +73,9 @@ const OUTBOX_FILE = path.join(BRIDGE_DIR, "outbox.jsonl");
 const REPLIED_FILE = path.join(BRIDGE_DIR, "replied.txt");
 const LAST_POLL_FILE = path.join(BRIDGE_DIR, "last_poll.json");
 const HEALTH_FILE = path.join(BRIDGE_DIR, "health.json");
+const TYPING_TICKET_FILE = path.join(BRIDGE_DIR, "typing_ticket.json");
+const UNKNOWN_SENDERS_FILE = path.join(BRIDGE_DIR, "unknown_senders.json");
+const TYPING_TICKET_TTL_MS = 540_000; // 9 分钟（学 gfydfhcf/wechat-ilink-muse-bridge）
 /** wx-bot 式健康心跳：连续失败 ≥3 次或 5 分钟无更新即视为异常。 */
 const HEALTH_STALE_MS = 5 * 60_000;
 const MINUS14_CONFIRM_MS = 5 * 60_000; // -14 可能是限流：先观察 5 分钟，持续才判过期（学 Liu-zhongxian/wechat-bridge）
@@ -348,6 +356,45 @@ async function fetchInboundMedia(entry, mediaItems) {
   return { metas, unavailable };
 }
 
+/** 陌生发信人只登记待批（学 gfydfhcf/wechat-ilink-muse-bridge 的 unknown_senders.json）：
+ *  不入队、不唤醒、不下载媒体；放行只能由主聊天人工决定，微信里说的不算。
+ *  最佳努力：写失败也不影响 poll。 */
+function noteUnknownSender(fromUserId) {
+  try {
+    const id = String(fromUserId ?? "");
+    if (!id) return;
+    let book = {};
+    try {
+      book = JSON.parse(fs.readFileSync(UNKNOWN_SENDERS_FILE, "utf-8"));
+      if (!book || typeof book !== "object") book = {};
+    } catch {}
+    const prev = book[id] ?? { count: 0 };
+    book[id] = { count: (prev.count ?? 0) + 1, last_seen_ms: Date.now() };
+    atomicWrite(UNKNOWN_SENDERS_FILE, JSON.stringify(book));
+  } catch {}
+}
+
+/** 引用还原：ref_msg 只带被引 id（+可选 partial_text 片段），原文查本地 inbox。 */
+function resolveQuote(entry, m, inboxById) {
+  try {
+    const ref = m.ref_msg ?? m.refMsg ?? null;
+    if (!ref || typeof ref !== "object") return;
+    const refId = ref.msg_id ?? ref.message_id ?? ref.id ?? ref.svr_id;
+    if (refId !== undefined && refId !== null && refId !== "") {
+      entry.quoted_msg_id = String(refId);
+    }
+    const partial = ref.partial_text ?? ref.partialText ?? "";
+    if (typeof partial === "string" && partial) entry.quoted_fragment = partial;
+    if (entry.quoted_msg_id && inboxById?.has(entry.quoted_msg_id)) {
+      const orig = inboxById.get(entry.quoted_msg_id);
+      if (orig?.text) entry.quoted_text = orig.text;
+      if (orig?.from) entry.quoted_from = orig.from;
+      if (orig?.media?.length) entry.quoted_kind = "media";
+      else entry.quoted_kind = "text";
+    }
+  } catch {}
+}
+
 async function cmdPoll(argv) {
   const quick = (argv ?? []).includes("--quick");
   // 非 quick 轮询跟随服务端建议的 longpolling_timeout_ms（两仓库同款做法）；
@@ -449,7 +496,9 @@ async function cmdPoll(argv) {
         );
         saveState(st1);
       }
-    const known = seenIds();
+    const inboxEntries = readInbox();
+    const known = new Set(inboxEntries.map((e) => String(e.id)).filter(Boolean));
+    const inboxById = new Map(inboxEntries.map((e) => [String(e.id), e]));
     const fresh = [];
     for (const m of resp.msgs ?? []) {
       if (m.message_type !== 1) continue; // only inbound user messages
@@ -460,6 +509,7 @@ async function cmdPoll(argv) {
       }
       if (bound && normUserId(m.from_user_id) !== normUserId(bound)) {
         summary.skipped.sender++;
+        noteUnknownSender(m.from_user_id);
         continue;
       }
       const id = String(m.message_id ?? m.seq ?? `${m.create_time_ms}`);
@@ -486,6 +536,10 @@ async function cmdPoll(argv) {
         entry.media = metas;
         entry.media_unavailable = unavailable;
       }
+      // 引用还原（学 gfydfhcf/wechat-ilink-muse-bridge）：服务端 ref_msg 只带被引
+      // 消息 id（选择性引用另带 partial_text 片段），原文靠本地 inbox 历史查。
+      // 查不到也不报错，只留片段；出站引用通道侧不支持，本桥不实现。
+      resolveQuote(entry, m, inboxById);
       fresh.push(entry);
     }
     appendInbox(fresh);
@@ -593,6 +647,14 @@ async function cmdSend(argv) {
     console.log(JSON.stringify(out));
     return;
   }
+  // 发送守卫（学 gfydfhcf/wechat-ilink-muse-bridge 的 --key 事故手记）：正文为空或以
+  // "--" 开头的一律拒绝、不发、只记审计——传错只会报错，不会把标志当消息发出去。
+  if (!text.trim() || text.trimStart().startsWith("--")) {
+    out.error = "refused: text is empty or starts with '--' (looks like a CLI flag, not message text)";
+    logOutbox({ kind: "text", to, status: "rejected", error: out.error });
+    console.log(JSON.stringify(out));
+    return;
+  }
   const acct = loadAccount();
   const chunks = chunkText(text);
   let failed = false;
@@ -631,6 +693,12 @@ async function cmdSendMedia(argv) {
   const file = get("--file");
   const type = get("--type");
   const caption = get("--caption") || "";
+  // 守卫同 cmdSend：以 "--" 开头的 caption 不是正文，直接丢弃并记审计，媒体照发。
+  let captionText = caption;
+  if (captionText.trimStart().startsWith("--")) {
+    logOutbox({ kind: "text", to, status: "rejected", error: "caption starts with '--', dropped", note: "media caption" });
+    captionText = "";
+  }
   const contextToken = get("--context-token") || undefined;
   if (!to || !file || !["image", "video", "file"].includes(type)) {
     out.error = "usage: sendmedia --to <user_id> --file <path> --type image|video|file [--caption <text>] [--context-token <ct>]";
@@ -671,12 +739,12 @@ async function cmdSendMedia(argv) {
       };
     }
     // 说明文字与媒体拆成独立请求：caption 先发、媒体随后（与参考实现 sendMediaItems 一致）。
-    if (caption) {
+    if (captionText) {
       const capClientId = `max-weixin:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
       const rc = await sendMessageOnce(
         acct.baseUrl,
         acct.token,
-        sendMsgEnvelope({ to, clientId: capClientId, itemList: [{ type: 1, text_item: { text: caption } }], contextToken }),
+        sendMsgEnvelope({ to, clientId: capClientId, itemList: [{ type: 1, text_item: { text: captionText } }], contextToken }),
       );
       if (rc.kind === "ok") {
         out.message_ids.push(rc.data.message_id ?? "");
@@ -708,6 +776,105 @@ async function cmdSendMedia(argv) {
   } catch (err) {
     out.error = String(err?.message ?? err);
     out.error_kind = "local";
+  }
+  console.log(JSON.stringify(out));
+}
+
+function loadTypingTickets() {
+  try {
+    const t = JSON.parse(fs.readFileSync(TYPING_TICKET_FILE, "utf-8"));
+    return t && typeof t === "object" ? t : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 取某用户最近一条 inbox 里的 context_token（typing 票据需要它）。 */
+function latestContextToken(to) {
+  const entries = readInbox();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (normUserId(e.from) === normUserId(to) && e.context_token) return e.context_token;
+  }
+  return "";
+}
+
+/** 取（或刷新）某用户的 typing_ticket，缓存 9 分钟（学参考实现）。体裁照抄参考实现。 */
+async function fetchTypingTicket(acct, to, force) {
+  const book = loadTypingTickets();
+  const now = Date.now();
+  const cached = book[normUserId(to)];
+  if (!force && cached?.ticket && now - (cached.at ?? 0) < TYPING_TICKET_TTL_MS) return cached.ticket;
+  const ctx = latestContextToken(to);
+  if (!ctx) return null;
+  const r = await postJsonClassified(
+    `${acct.baseUrl}/ilink/bot/getconfig`,
+    acct.token,
+    { ilink_user_id: to, context_token: ctx, base_info: { channel_version: "1.0.2" } },
+    API_TIMEOUT_MS,
+  );
+  if (r.kind !== "ok") return null;
+  const ticket = r.data?.typing_ticket;
+  if (!ticket) return null;
+  book[normUserId(to)] = { ticket, at: now };
+  try {
+    atomicWrite(TYPING_TICKET_FILE, JSON.stringify(book));
+  } catch {}
+  return ticket;
+}
+
+/**
+ * 显示/取消“正在输入”：typing --to <user_id> <start|stop>。
+ * 装饰性功能，失败只打印 ok:false，永不抛错、永不阻塞调用方。
+ */
+async function cmdTyping(argv) {
+  const out = { ok: false, error: null };
+  const get = (k) => {
+    const i = argv.indexOf(k);
+    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : "";
+  };
+  const to = get("--to") || argv[0] || "";
+  const word = argv[argv.length - 1] || "";
+  const status = { start: 1, stop: 2 }[word];
+  if (!to || status === undefined) {
+    out.error = "usage: typing --to <user_id> <start|stop>";
+    console.log(JSON.stringify(out));
+    return;
+  }
+  try {
+    const acct = loadAccount();
+    let ticket = await fetchTypingTicket(acct, to, false);
+    if (!ticket) {
+      out.error = "NO_TYPING_TICKET";
+      console.log(JSON.stringify(out));
+      return;
+    }
+    const sendOnce = (t) =>
+      postJsonClassified(
+        `${acct.baseUrl}/ilink/bot/sendtyping`,
+        acct.token,
+        { ilink_user_id: to, typing_ticket: t, status, base_info: { channel_version: "1.0.2" } },
+        API_TIMEOUT_MS,
+      );
+    let r = await sendOnce(ticket);
+    if (r.kind !== "ok") {
+      // 票据可能已失效：强制刷新后重试一次；仍无票据直接报错，不发必然失败的请求。
+      ticket = await fetchTypingTicket(acct, to, true);
+      if (!ticket) {
+        out.error = "NO_TYPING_TICKET";
+        console.log(JSON.stringify(out));
+        return;
+      }
+      r = await sendOnce(ticket);
+    }
+    if (r.kind !== "ok") {
+      out.error = `TYPING_FAILED: ${r.error}`;
+      console.log(JSON.stringify(out));
+      return;
+    }
+    out.ok = true;
+  } catch (err) {
+    out.error = `TYPING_ERROR: ${String(err?.message ?? err)}`;
   }
   console.log(JSON.stringify(out));
 }
@@ -818,10 +985,11 @@ if (cmd === "poll") await cmdPoll(rest);
 else if (cmd === "send") await cmdSend(rest);
 else if (cmd === "sendmedia") await cmdSendMedia(rest);
 else if (cmd === "mark") await cmdMark(rest);
+else if (cmd === "typing") await cmdTyping(rest);
 else if (cmd === "status") await cmdStatus();
 else if (cmd === "login") await cmdLogin();
 else {
-  console.error("usage: wxbridge.mjs <poll|send|sendmedia|mark|status|login> ...");
+  console.error("usage: wxbridge.mjs <poll|send|sendmedia|mark|typing|status|login> ...");
   process.exit(1);
 }
 
